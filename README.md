@@ -8,6 +8,21 @@
 - Download and resolve dependencies: In the project root run `go mod tidy`
 - Get the `river` command line tool `go install github.com/riverqueue/river/cmd/river@latest`
 
+### Tip
+
+You can quickly start up a small Postgres server on your local machine with a cmd as below.
+
+Note that you will need to create the `pg_data` folder in your home dir, and fill in your own username and password
+
+```bash
+docker run -it --rm \
+  -e 'POSTGRES_PASSWORD=mysecret' \
+  -e 'POSTGRES_USER=me' \
+  -p 5432:5432 \
+  -v /Users/Me/pg_data:/var/lib/postgresql/data \
+  postgres:16-alpine
+```
+
 ## DB Migration for River
 
 - `river migrate-up --database-url "postgres://{user}:{password}@localhost:5432/postgres?sslmode=disable"`
