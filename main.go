@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -13,12 +15,17 @@ import (
 	"github.com/riverqueue/river/rivershared/util/slogutil"
 )
 
+// pgConnStr can look something like this:
+// `postgres://<user>:<password>@localhost:5432/postgres?sslmode=disable`
+var pgConnStr = os.Getenv("PG_CONN_STR")
+
+// ONE-TIME JOB DEFINITION
 type SortArgs struct {
 	// Strings is a slice of strings to sort.
 	Strings []string `json:"strings"`
 }
 
-func (SortArgs) Kind() string { return "sort" }
+func (SortArgs) Kind() string { return "SortJob" }
 
 type SortWorker struct {
 	river.WorkerDefaults[SortArgs]
@@ -30,41 +37,72 @@ func (w *SortWorker) Work(ctx context.Context, job *river.Job[SortArgs]) error {
 	return nil
 }
 
-// Example_insertAndWork demonstrates how to register job workers, start a
-// client, and insert a job on it to be worked.
+// PERIODIC JOB DEFINITION
+type PeriodicJobArgs struct{}
+
+// Kind is the unique string name for this job.
+func (PeriodicJobArgs) Kind() string { return "PeriodicJob" }
+
+// PeriodicJobWorker is a job worker for sorting strings.
+type PeriodicJobWorker struct {
+	river.WorkerDefaults[PeriodicJobArgs]
+}
+
+func (w *PeriodicJobWorker) Work(ctx context.Context, job *river.Job[PeriodicJobArgs]) error {
+	fmt.Printf("Period job called: %s\n", time.Now().String())
+	return nil
+}
+
+// This example demonstrates how to register job types on workers, start a
+// client, and insert jobs to be worked.
 func main() {
 	ctx := context.Background()
 
-	dbPool, err := pgxpool.NewWithConfig(ctx, &pgxpool.Config{})
+	dbPool, err := pgxpool.New(ctx, pgConnStr)
 	if err != nil {
-		panic(err)
+		handleCriticalError(err)
 	}
 	defer dbPool.Close()
 
+	// Add worker (job) types to the workers pool
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &SortWorker{})
-	// Alternative approach:
-	// river.AddWorker(workers, &SortWorker{})
+	river.AddWorker(workers, &PeriodicJobWorker{})
 
+	// A Client will run job instances
 	riverClient, err := river.NewClient(riverpgxv5.New(dbPool), &river.Config{
 		Logger: slog.New(&slogutil.SlogMessageOnlyHandler{Level: slog.LevelWarn}),
+		PeriodicJobs: []*river.PeriodicJob{
+			river.NewPeriodicJob(
+				river.PeriodicInterval(10*time.Second),
+				func() (river.JobArgs, *river.InsertOpts) {
+					return PeriodicJobArgs{}, nil
+				},
+				&river.PeriodicJobOpts{RunOnStart: true},
+			),
+		},
 		Queues: map[string]river.QueueConfig{
-			river.QueueDefault: {MaxWorkers: 100},
+			river.QueueDefault: {MaxWorkers: 10},
 		},
 		TestOnly: true, // suitable only for use in tests; remove for live environments
 		Workers:  workers,
 	})
 	if err != nil {
-		panic(err)
+		handleCriticalError(err)
 	}
 
-	// Out of example scope, but used to wait until a job is worked.
+	// Subscribe to completed jobs
 	subscribeChan, subscribeCancel := riverClient.Subscribe(river.EventKindJobCompleted)
 	defer subscribeCancel()
 
 	if err := riverClient.Start(ctx); err != nil {
-		panic(err)
+		handleCriticalError(err)
 	}
+	defer func() {
+		if err := riverClient.Stop(ctx); err != nil {
+			handleCriticalError(err)
+		}
+	}()
 
 	// Start a transaction to insert a job. It's also possible to insert a job
 	// outside a transaction, but this usage is recommended to ensure that all
@@ -73,32 +111,65 @@ func main() {
 	// worked until the transaction has committed.
 	tx, err := dbPool.Begin(ctx)
 	if err != nil {
-		panic(err)
+		handleCriticalError(err)
 	}
 	defer tx.Rollback(ctx)
 
+	// Insert a one-time job
 	_, err = riverClient.InsertTx(ctx, tx, SortArgs{
 		Strings: []string{
 			"whale", "tiger", "bear",
 		},
 	}, nil)
 	if err != nil {
-		panic(err)
+		handleCriticalError(err)
 	}
+
+	// Insert another one-time job
+	_, err = riverClient.InsertTx(ctx, tx, SortArgs{
+		Strings: []string{
+			"goat", "whale", "cat", "dog", "mouse", "horse",
+		},
+	}, nil)
+	if err != nil {
+		handleCriticalError(err)
+	}
+
+	// Note: Periodic Jobs don't need to be inserted -- they will start once the client starts
 
 	if err := tx.Commit(ctx); err != nil {
-		panic(err)
+		handleCriticalError(err)
 	}
 
-	waitForNJobs(subscribeChan, 1)
+	fmt.Println("Waiting for some jobs to complete...")
+	waitForNJobs(subscribeChan, 4)
 
-	if err := riverClient.Stop(ctx); err != nil {
-		panic(err)
-	}
+	riverClient.PeriodicJobs().Clear()
+
+	// Periodic jobs can also be configured dynamically after a client has
+	// already started. Added jobs are scheduled for run immediately.
+	fmt.Println("Adding a new periodic job...")
+	riverClient.PeriodicJobs().Add(
+		river.NewPeriodicJob(
+			river.PeriodicInterval(5*time.Second),
+			func() (river.JobArgs, *river.InsertOpts) {
+				return PeriodicJobArgs{}, nil
+			},
+			nil,
+		),
+	)
+
+	fmt.Println("Waiting for more jobs to complete...")
+	waitForNJobs(subscribeChan, 3)
 }
 
 func waitForNJobs(subscribeChan <-chan *river.Event, n int) {
 	for range n {
 		<-subscribeChan
 	}
+}
+
+func handleCriticalError(err error) {
+	fmt.Println("Error:", err)
+	os.Exit(1)
 }

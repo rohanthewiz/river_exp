@@ -1,1 +1,6 @@
 .idea/
+.vscode/
+.zed/
+.DS_Store
+
+river_exp
